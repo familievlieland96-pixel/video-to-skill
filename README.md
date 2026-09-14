@@ -21,16 +21,62 @@ whisper.cpp, vision_analyze). No Microsoft.
 If whisper.cpp is not set up, the pipeline **fails loudly** with the exact
 command to run - it never silently fakes a transcript.
 
-## Termux Setup (one-time)
+## Termux Setup on Android (one-time, ~15 minutes)
+
+Done once per phone. Everything after that is just running the pipeline.
+
+### 0. Prerequisites
+- Termux installed (use the F-Droid build — the Play Store version is frozen and
+  breaks on updates).
+- Internet connection (model download is ~148 MB).
+
+### 1. Install the toolchain
 ```bash
-pkg install -y ffmpeg yt-dlp git python cmake
-# Build whisper.cpp if not present
-cd ~ && git clone https://github.com/ggerganov/whisper.cpp && cd whisper.cpp
+pkg update
+pkg install -y build-essential cmake ffmpeg python git python-yt-dlp
+```
+- `build-essential` = clang + linkers (needed to compile whisper.cpp)
+- `python-yt-dlp` = the `yt-dlp` command for downloading videos
+- `ffmpeg` = video decoding + frame extraction
+
+### 2. Build whisper.cpp
+```bash
+cd ~
+git clone https://github.com/ggerganov/whisper.cpp
+cd whisper.cpp
 cmake -B build -DCMAKE_BUILD_TYPE=Release -DWHISPER_SDL2=OFF \
       -DWHISPER_BUILD_TESTS=OFF -DWHISPER_COMMON_FFMPEG=ON
 cmake --build build -j
-cd models && bash download-ggml-model.sh base.en
 ```
+If you already have `~/whisper.cpp` built, skip to step 3.
+The flags matter:
+- `WHISPER_SDL2=OFF` — without this the configure step fails on Termux
+  (SDL2 is a GUI library Termux does not ship).
+- `WHISPER_COMMON_FFMPEG=ON` — lets `whisper-cli` read .mp4/.mkv directly,
+  no manual conversion to .wav.
+
+### 3. Download the model
+```bash
+cd models
+bash download-ggml-model.sh base.en      # ~148 MB, English, fastest good quality
+```
+(For non-English video use `small` or `large-v3` — same command, bigger download.)
+
+### 4. Verify the setup works — do not skip
+```bash
+cd ~/whisper.cpp
+./build/bin/whisper-cli -m models/ggml-base.en.bin samples/jfk.wav
+```
+If you see the JFK quote ("...and so my fellow Americans..."), the whole
+toolchain is working. If not, stop and fix this step before running the
+pipeline — the pipeline itself fails loudly and points back here if whisper
+is not ready.
+
+### Local videos on Android storage
+```bash
+termux-setup-storage     # once, grant access
+```
+Then pass the full path: `python3 video_to_skill.py /sdcard/Download/clip.mp4 "..."`
 
 ## Quick Start
 ```bash
