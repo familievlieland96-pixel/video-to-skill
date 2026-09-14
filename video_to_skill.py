@@ -21,10 +21,45 @@ import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
+from collections import Counter
 
 # --- whisper.cpp locations (built locally, see docstring) ---
 WHISPER_CLI = Path("~/whisper.cpp/build/bin/whisper-cli").expanduser()
 WHISPER_MODEL = Path("~/whisper.cpp/models/ggml-base.en.bin").expanduser()
+
+# --- Section detection patterns ---
+SECTION_PATTERNS = [
+    r"^(step|phase|part|section|chapter|episode|number|number\s*\d+|let's\s+\w+)\s+(.*)",
+    r"^(first|second|third|fourth|next|then|after|finally|last)\b\s*(.*)",
+    r"^(\d+)[\.:\)]\s*(.*)",
+    r"^(-{3,}|\*{3,}|#{3,})\s*(.*)",
+    r"^(##+)\s*(.*)",
+]
+
+KEYWORD_THEMES = {
+    "tutorial": ["how to", "learn", "guide", "teach", "tutorial", "step by step"],
+    "analysis": ["analyze", "analysis", "breakdown", "examining", "study"],
+    "process": ["process", "workflow", "pipeline", "system", "method"],
+    "tools": ["tool", "software", "app", "program", "code", "script"],
+    "strategy": ["strategy", "approach", "technique", "method", "framework"],
+    "review": ["review", "rated", "score", "pros", "cons", "verdict"],
+    "news": ["news", "update", "report", "breaking", "announced"],
+    "comparison": ["compare", "vs", "versus", "difference", "compared"],
+    "opinion": ["opinion", "thoughts", "feel", "believe", "think"],
+    "interview": ["interview", "conversing", "chatting with", "asking"],
+}
+
+IMPORTANT_SENTENCE_PATTERNS = [
+    r"(?:most important|key takeaway|crucial|essential|critical|fundamental|vital)",
+    r"(?:remember that|note that|keep in mind|pay attention)",
+    r"(?:the main point|the key idea|the bottom line|essentially)",
+    r"(?:in conclusion|to summarize|overall|ultimately|finally)",
+    r"(?:if you only remember|don't forget|make sure|be sure)",
+    r"(?:here's the thing|here's what matters|what's really important)",
+    r"(?:pro tip|bonus tip|secret|hack|trick|shortcut)",
+    r"(?:warning|caution|heads up|watch out|be careful)",
+    r"(?:common mistake|avoid this|don't do this|this is wrong)",
+]
 
 
 def ensure_whisper():
@@ -98,6 +133,232 @@ def slugify(text: str, max_len: int = 32) -> str:
     return slug[:max_len].rstrip("-") or "video-derived-skill"
 
 
+def detect_theme(transcript: str) -> list[str]:
+    """Detect what themes/topics the transcript covers."""
+    text_lower = transcript.lower()
+    themes = []
+    for theme, keywords in KEYWORD_THEMES.items():
+        score = sum(1 for kw in keywords if kw in text_lower)
+        if score >= 2:
+            themes.append(theme)
+    return themes[:3] if themes else ["general"]
+
+
+def extract_sections(transcript: str) -> list[dict]:
+    """Try to identify logical sections in the transcript."""
+    lines = transcript.split("\n")
+    sections = []
+    current_section = {"title": "Introduction", "content": []}
+
+    for line in lines:
+        line_stripped = line.strip()
+        if not line_stripped:
+            continue
+
+        matched = False
+        for pattern in SECTION_PATTERNS:
+            m = re.match(pattern, line_stripped, re.IGNORECASE)
+            if m:
+                # Save current section if it has content
+                if current_section["content"]:
+                    sections.append(current_section)
+                # Start new section
+                title = m.group(2) if m.lastindex >= 2 else m.group(1)
+                # Clean up title
+                title = re.sub(r"^(step|phase|part|section|chapter)\s*", "", title, flags=re.IGNORECASE).strip()
+                title = re.sub(r"^\d+[.:\)]\s*", "", title).strip()
+                current_section = {"title": title[:60], "content": []}
+                matched = True
+                break
+
+        if not matched:
+            current_section["content"].append(line_stripped)
+
+    if current_section["content"]:
+        sections.append(current_section)
+
+    return sections if len(sections) > 1 else []
+
+
+def extract_key_points(transcript: str, max_points: int = 8) -> list[str]:
+    """Extract the most important sentences from the transcript."""
+    sentences = re.split(r"[.!?\n]{1,3}", transcript)
+    sentences = [s.strip() for s in sentences if len(s.strip()) > 30]
+
+    scored = []
+    for sent in sentences:
+        score = 0
+        sent_lower = sent.lower()
+        for pattern in IMPORTANT_SENTENCE_PATTERNS:
+            if re.search(pattern, sent_lower):
+                score += 3
+        # Bonus for length (more detail = more likely important)
+        score += min(len(sent) / 100, 2)
+        # Bonus for containing numbers/stats
+        if re.search(r"\d+%|\d+\s*(million|billion|thousand)|#\d+", sent_lower):
+            score += 2
+        scored.append((score, sent))
+
+    scored.sort(reverse=True, key=lambda x: x[0])
+    return [s for _, s in scored[:max_points]]
+
+
+def extract_procedures(transcript: str, max_steps: int = 6) -> list[str]:
+    """Try to extract numbered or sequential procedures."""
+    lines = transcript.split("\n")
+    procedures = []
+    current_step = None
+    step_number = 0
+
+    for line in lines:
+        line_stripped = line.strip()
+        # Match numbered steps
+        step_match = re.match(r"^(\d+)[\.\)]\s+(.+)", line_stripped)
+        if step_match:
+            if current_step and len(current_step) > 10:
+                procedures.append(current_step)
+            step_number = int(step_match.group(1))
+            current_step = step_match.group(2).strip()
+            continue
+
+        # Match "first", "second", etc.
+        ordinal_match = re.match(
+            r"^(first|second|third|fourth|next|then|afterwards|finally|last)\b[,.:]\s+(.+)",
+            line_stripped, re.IGNORECASE
+        )
+        if ordinal_match:
+            if current_step and len(current_step) > 10:
+                procedures.append(current_step)
+            current_step = f"{ordinal_match.group(1).capitalize()}: {ordinal_match.group(2).strip()}"
+            continue
+
+        # Continuation of current step
+        if current_step and len(line_stripped) > 5:
+            current_step += " " + line_stripped
+
+    if current_step and len(current_step) > 10:
+        procedures.append(current_step)
+
+    # Also look for bullet points
+    bullets = [l.strip("-•*") for l in lines if re.match(r"^[\s]*[-•*]\s+", l)]
+    procedures.extend(bullets)
+
+    # Deduplicate and limit
+    seen = set()
+    unique = []
+    for p in procedures:
+        p_clean = p.strip()
+        if p_clean and p_clean not in seen and len(p_clean) > 15:
+            seen.add(p_clean)
+            unique.append(p_clean)
+            if len(unique) >= max_steps:
+                break
+
+    return unique
+
+
+def generate_skill_name(transcript: str, prompt: str) -> tuple[str, str]:
+    """Generate a meaningful skill name and description from transcript content."""
+    # Try to extract topic from transcript
+    words = re.findall(r"\b\w{4,}\b", transcript.lower())
+    common = [w for w, c in Counter(words).most_common(20)
+              if c >= 3 and w not in ("this", "that", "with", "from", "have", "will", "been",
+                                       "they", "their", "there", "about", "would", "could",
+                                       "should", "what", "when", "where", "which", "than",
+                                       "then", "into", "over", "also", "just", "made",
+                                       "only", "very", "much", "each", "other", "some",
+                                       "more", "most", "being", "because", "before",
+                                       "through", "between", "after", "these", "those")]
+
+    # Look for the main topic
+    topic_candidates = common[:5]
+    skill_base = prompt if prompt else " ".join(topic_candidates[:3])
+
+    name = slugify(skill_base)
+    desc = f"Extracted from video: {slugify(skill_base, 30)}."
+    if len(desc) > 59:
+        desc = desc[:59]
+
+    return name, desc
+
+
+def build_skill(transcript: str, prompt: str) -> str:
+    """Build a proper Hermes SKILL.md from transcript content."""
+    skill_name, skill_desc = generate_skill_name(transcript, prompt)
+    themes = detect_theme(transcript)
+    sections = extract_sections(transcript)
+    key_points = extract_key_points(transcript)
+    procedures = extract_procedures(transcript)
+
+    # Build the skill content
+    lines = []
+    lines.append("---")
+    lines.append(f"name: {skill_name}")
+    lines.append(f"description: \"{skill_desc}\"")
+    lines.append("version: 0.1.0")
+    lines.append("author: video-to-skill")
+    lines.append("license: MIT")
+    lines.append("platforms: [linux, macos, windows]")
+    lines.append("metadata:")
+    lines.append("  hermes:")
+    lines.append("    tags: [video-derived, automation]")
+    related = [f"video-to-skill-{t}" for t in themes if t != "general"]
+    lines.append(f"    related_skills: [{', '.join(related)}]")
+    lines.append("---")
+    lines.append("")
+    lines.append(f"# {skill_name.replace('-', ' ').title()}")
+    lines.append("")
+
+    # Overview from transcript summary
+    lines.append("## Overview")
+    lines.append(f"Skill derived from video content. Themes: {', '.join(themes)}.")
+    lines.append("")
+
+    # Key takeaways
+    if key_points:
+        lines.append("## Key Takeaways")
+        for i, point in enumerate(key_points, 1):
+            # Truncate very long points
+            if len(point) > 200:
+                point = point[:197] + "..."
+            lines.append(f"{i}. {point}")
+        lines.append("")
+
+    # Procedures/Steps
+    if procedures:
+        lines.append("## Procedure")
+        for i, step in enumerate(procedures, 1):
+            lines.append(f"{i}. {step}")
+        lines.append("")
+
+    # When to use
+    lines.append("## When to Use")
+    lines.append(f"- Topics covered: {', '.join(themes)}")
+    lines.append("- [Review transcript for specific use cases]")
+    lines.append("")
+
+    # Structure from sections
+    if sections:
+        lines.append("## Content Structure")
+        for sec in sections[:5]:  # Limit to first 5 sections
+            lines.append(f"- **{sec['title']}**: {' '.join(sec['content'][:2])}...")
+        lines.append("")
+
+    # Full transcript reference
+    lines.append("## Full Transcript")
+    lines.append("See the companion book file for complete transcript and analysis.")
+    lines.append("")
+
+    # Verification
+    lines.append("## Verification")
+    lines.append("- [ ] Review transcript in companion book for accuracy")
+    lines.append("- [ ] Validate key points against original video")
+    lines.append("- [ ] Test procedures with actual example")
+    lines.append("")
+
+    return "\n".join(lines)
+
+
 def process_video(video_input: str, prompt: str) -> dict:
     ensure_whisper()
 
@@ -118,42 +379,18 @@ def process_video(video_input: str, prompt: str) -> dict:
     book_path.write_text(
         f"# Video Book - {timestamp}\n\n"
         f"## Source\nVideo: {video_input}\nPrompt: {prompt}\n\n"
-        f"## Transcript (base of the skill)\n{transcript}\n\n"
+        f"## Transcript\n{transcript}\n\n"
         f"## Visual Analysis\n- {frames} key frames in output/frames/ "
         f"(use vision_analyze in Hermes for detail).\n\n"
         f"## Action Items\n- {prompt}\n"
-        f"- Review the transcript above and distill techniques into a skill.\n",
+        f"- Review the transcript above and distill techniques.\n",
         encoding="utf-8",
     )
 
-    # --- skill (text-driven) ---
-    skill_name = slugify(prompt)
-    desc = (f"Video-derived: {slugify(prompt, 30)}.").rstrip()
-    if len(desc) > 59:
-        desc = desc[:59]
+    # --- skill (content-driven) ---
+    skill_content = build_skill(transcript, prompt)
     skill_path = output_dir / f"skill_{timestamp}.md"
-    skill_path.write_text(
-        "---\n"
-        f"name: {skill_name}\n"
-        f'description: "{desc}"\n'
-        "version: 0.1.0\n"
-        "author: Bossman via video-to-skill\n"
-        "license: MIT\n"
-        "platforms: [linux, macos, windows]\n"
-        "metadata:\n"
-        "  hermes:\n"
-        "    tags: [video-derived, automation]\n"
-        "    related_skills: [video-to-skill, hermes-agent-skill-authoring]\n"
-        "---\n"
-        f"# {skill_name.capitalize()}\n\n"
-        "Distilled from the transcript of the source video (see the book for the\n"
-        "full text and frames). Fill in the real content from the transcript below.\n\n"
-        f"## Source Transcript Excerpt\n```\n{transcript[:3000]}\n```\n\n"
-        "## When to Use\n- [fill from transcript]\n\n"
-        "## Procedure\n1. [fill from transcript]\n\n"
-        "## Verification\n- [fill from transcript]\n",
-        encoding="utf-8",
-    )
+    skill_path.write_text(skill_content, encoding="utf-8")
 
     return {
         "status": "success",
