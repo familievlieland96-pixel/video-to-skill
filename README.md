@@ -15,11 +15,34 @@ whisper.cpp, vision_analyze). No Microsoft.
 2. Transcribes it with **whisper.cpp** (local, offline - the real model, no stubs).
 3. Samples scene-aware key frames with ffmpeg (for later vision_analyze detail).
 4. Builds the **book** - source + full transcript + frame notes + action items.
-5. Auto-authors a Hermes SKILL.md from the transcript (follows our skill-authoring
-   standards), saving both to `output/`.
+5. Auto-authors a **draft** Hermes SKILL.md from the transcript (the transcript is the
+   source of truth; the draft contains no invented steps, and clearly marks every
+   "edit me" line that still needs a human). Saving both go to `output/`.
+6. Runs the **hard gate** (`validate_skill.py`) on the generated skill. If the gate
+   rejects it (hollow, placeholder, or too little transcript to distill from), the
+   pipeline **fails loudly** and tells you exactly what to fix - it never hands you
+   a stub dressed up as a finished skill.
 
 If whisper.cpp is not set up, the pipeline **fails loudly** with the exact
 command to run - it never silently fakes a transcript.
+
+## The Gate (validate_skill.py)
+`validate_skill.py <skill.md>` is the hard stop between "pipeline wrote a file" and
+"you trust the skill":
+- `exit 0` -> the file is clean (no placeholder strings, and the Transcript /
+  Procedure / Verification sections are actually populated). Pipeline continues.
+- `exit 1` -> the file is hollow. Pipeline fails and points you at the exact
+  line to fix.
+
+The gate is the last step of every pipeline run - it is called automatically in
+`video_to_skill.py` (`gate_skill_file`), so you do not have to remember to run it.
+You can also run it standalone on any skill file before you `skill_view` it.
+
+A note on honesty: the pipeline intentionally emits a **draft**, not a finished
+skill. A real skill needs you to read the transcript and fill the "edit me" steps
+from specific passages - the pipeline will not fabricate those for you. The gate's
+job is to make sure you can never ship a version where that step was skipped and
+left invisible.
 
 ## Termux Setup on Android (one-time, ~15 minutes)
 
@@ -85,7 +108,8 @@ python3 video_to_skill.py "https://example.com/video.mp4" "Extract key technique
 ```
 
 Output in `output/`: `book_*.md` (transcript + frames + actions) and
-`skill_*.md` (ready to load with skill_view or skill_manage).
+`skill_*.md` (a **draft** that passed the gate - fill its "edit me" steps from the
+transcript, then `skill_view` / `skill_manage` it).
 
 ## Usage in Hermes
 Run the script, then load the generated skill with `skill_view` / `skill_manage`.
