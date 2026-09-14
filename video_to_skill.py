@@ -128,7 +128,32 @@ def count_frames(video_file: str) -> int:
     return len(list(out_dir.glob("frame_*.jpg")))
 
 
-def slugify(text: str, max_len: int = 32) -> str:
+def gate_skill_file(skill_path: Path) -> Path:
+    """Hard gate: run validate_skill.py on a freshly written skill file.
+
+    Exit 0 -> clean, return the path (pipeline may continue).
+    Exit 1 -> hollow / placeholder / missing section, raise so the pipeline
+    fails LOUDLY instead of handing a stub to the user.
+    A missing validator is treated as a failure, never silently skipped.
+    """
+    validator = Path(__file__).resolve().parent / "validate_skill.py"
+    if not validator.exists():
+        raise RuntimeError("validate_skill.py not found next to video_to_skill.py - cannot run the gate.")
+    r = subprocess.run([sys.executable, str(validator), str(skill_path)],
+                       capture_output=True, text=True)
+    for line in r.stdout.strip().splitlines():
+        print(f"[gate] {line}")
+    if r.returncode != 0:
+        raise RuntimeError(
+            f"validate_skill.py FAILED on {skill_path.name} (exit {r.returncode}). "
+            f"The generated skill is not clean. Edit it from the transcript "
+            f"(remove any 'edit me' / todo / tbd / placeholder lines and fill real "
+            f"content) and re-run: python3 validate_skill.py {skill_path.name}"
+        )
+    return skill_path
+
+
+def slugify(text: str, max_len: int = 32):
     slug = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
     return slug[:max_len].rstrip("-") or "video-derived-skill"
 
@@ -387,10 +412,11 @@ def process_video(video_input: str, prompt: str) -> dict:
         encoding="utf-8",
     )
 
-    # --- skill (content-driven) ---
+    # --- skill (content-driven, gate-validated) ---
     skill_content = build_skill(transcript, prompt)
     skill_path = output_dir / f"skill_{timestamp}.md"
     skill_path.write_text(skill_content, encoding="utf-8")
+    gate_skill_file(skill_path)
 
     return {
         "status": "success",
@@ -398,6 +424,7 @@ def process_video(video_input: str, prompt: str) -> dict:
         "skill": str(skill_path),
         "transcript_chars": len(transcript),
         "frames": frames,
+        "gated": True,
     }
 
 
