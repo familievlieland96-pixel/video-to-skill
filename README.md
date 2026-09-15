@@ -26,6 +26,34 @@ whisper.cpp, vision_analyze). No Microsoft.
 If whisper.cpp is not set up, the pipeline **fails loudly** with the exact
 command to run - it never silently fakes a transcript.
 
+## YouTube bot-check countermeasures
+When the source is a YouTube URL, `download_video` is tuned to avoid / climb
+the "Sign in to confirm you're not a bot" wall:
+- **Keep yt-dlp current.** The #1 defense. If the wall appears, run
+  `yt-dlp -U` (or `yt-dlp -U youtube-dl/ytdl-nightly`) and retry — YouTube
+  breaks older extractors roughly every few weeks.
+- **Low-height progressive format pick.** `-f "b[height<=480]/bv*[height<=480]+ba/b"`
+  stays in the free, no-sign-in rendition class.
+- **Permissive player client.** `--extractor-args "youtube:player_client=web_embedded"`.
+- **Cookies file (optional).** Set `YT_COOKIES=~/path/to/cookies.txt` (a
+  Netscape export from a signed-in browser on *another* device — Termux has no
+  local browser, so `--cookies-from-browser` is not usable here).
+- **Egress proxy (optional).** Set `YT_PROXY=socks5://127.0.0.1:9050` (Tor)
+  only if the network itself is flagged; phone-VPN egress needs none.
+
+The pipeline also resolves the real container file itself: yt-dlp chooses the
+extension (`.mp4` for pure-video, `.webm` for a merged progressive stream), so
+the download step globs `video_download.*` instead of hard-coding `.mp4` — a
+bug that would otherwise make the transcribe step miss the file.
+
+## Optional env vars (download step)
+| Var        | Purpose                                                            |
+|------------|--------------------------------------------------------------------|
+| `YT_COOKIES` | Netscape `cookies.txt` path for the bot-check fallback          |
+| `YT_PROXY`   | e.g. `socks5://127.0.0.1:9050` (Tor)                          |
+| `YT_OUT`     | output base name (default `video_download`)                     |
+
+
 ## The Gate (validate_skill.py)
 `validate_skill.py <skill.md>` is the hard stop between "pipeline wrote a file" and
 "you trust the skill":

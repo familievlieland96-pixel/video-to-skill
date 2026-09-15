@@ -13,9 +13,18 @@ Whisper setup (one-time):
       -DWHISPER_SDL2=OFF -DWHISPER_BUILD_TESTS=OFF -DWHISPER_COMMON_FFMPEG=ON
   cmake --build build -j
   cd models && bash download-ggml-model.sh base.en
+
+Optional env vars (download step):
+  YT_COOKIES  path to a Netscape cookies.txt from a signed-in browser session
+              (Termux has no local browser, so --cookies-from-browser is
+              not available - export the file on another device)
+  YT_PROXY    e.g. socks5://127.0.0.1:9050 (Tor); phone-VPN egress needs none
+  YT_OUT      output base name (default: video_download; yt-dlp appends the
+              container extension it chooses)
 """
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -77,19 +86,98 @@ def ensure_whisper():
 
 
 def download_video(url: str) -> str:
-    """Download a remote video with yt-dlp (Termux-safe, ffmpeg available)."""
-    out = "video_download.mp4"
-    cmd = ["yt-dlp", "-f", "best[height<=720]", "-o", out, url]
+    """Download a remote video with yt-dlp (Termux-safe, ffmpeg available).
+
+    Returns the path to the actual downloaded file (yt-dlp chooses the
+    container extension itself, e.g. .mp4 or .webm - do not hard-code it).
+
+    YouTube countermeasures, in order of effect:
+      1. Keep yt-dlp CURRENT - a recent extractor + the low-height progressive
+         format pick stays in the no-sign-in stream class. If a bot-check
+         ("Sign in to confirm you're not a bot") appears, first run
+         `yt-dlp -U` (or `yt-dlp -U youtube-dl/ytdl-nightly`) and retry.
+      2. Force a permissive player client:
+         --extractor-args "youtube:player_client=web_embedded"
+      3. Feed a cookies file (YT_COOKIES) exported from a signed-in browser on
+         another device. In Termux --cookies-from-browser does NOT work
+         (no local browser), so the manual .txt export is the only option.
+      4. An egress proxy (YT_PROXY, e.g. Tor) when the network itself is
+         flagged. Phone-VPN egress needs none.
+
+    Format: prefer a single progressive stream <=480p; fall back to best
+    video+best audio only if no progressive stream exists. Staying <=480p
+    keeps the requested rendition in the free, no-sign-in class.
+    """
+    out_base = os.environ.get("YT_OUT", "video_download")
+    out_dir = Path.cwd()
+    cmd = [
+        "yt-dlp",
+        "-f", "b[height<=480]/bv*[height<=480]+ba/b",
+        "--no-playlist",
+        "-o", str(out_dir / f"{out_base}.%(ext)s"),
+        # countermeasure 2 - permissive player client for public videos
+        "--extractor-args", "youtube:player_client=web_embedded",
+    ]
+    # countermeasure 3 - optional cookies file (Termux: manual export only)
+    cookies = os.environ.get("YT_COOKIES")
+    if cookies:
+        cpath = Path(cookies).expanduser()
+        if cpath.exists():
+            cmd += ["--cookies", str(cpath)]
+        else:
+            print(f"WARNING: YT_COOKIES={cookies} does not exist - continuing without cookies", file=sys.stderr)
+    # countermeasure 4 - optional egress proxy
+    proxy = os.environ.get("YT_PROXY")
+    if proxy:
+        cmd += ["--proxy", proxy]
+    cmd.append(url)
+
     print("Downloading video...")
-    r = subprocess.run(cmd, capture_output=True, text=True)
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
     if r.returncode != 0:
-        raise RuntimeError(f"yt-dlp failed: {r.stderr.strip()[:400]}")
-    return out
+        stderr = r.stderr.strip()
+        if "Sign in to confirm you're not a bot" in stderr or "please log in" in stderr.lower():
+            raise RuntimeError(
+                "yt-dlp hit YouTube's bot-check wall. Climb the ladder:\n"
+                "  1) yt-dlp -U  (or: yt-dlp -U youtube-dl/ytdl-nightly) then re-run this command\n"
+                "  2) set YT_COOKIES=~/path/to/cookies.txt (exported from a signed-in browser on another device)\n"
+                f"Details: {stderr[-400:]}"
+            )
+        raise RuntimeError(f"yt-dlp failed: {stderr[:400]}")
+
+    # Resolve the real file. The -o template above writes to <base>.<ext> where
+    # yt-dlp picks <ext> (mp4 for pure-video, webm for merged progressive, ...).
+    # A single candidate is the normal case; glob to be honest about the extension.
+    candidates = sorted(out_dir.glob(f"{out_base}.*"))
+    if not candidates:
+        # Fall back to the literal base name (older yt-dlp that ignores %(ext)s).
+        literal = out_dir / out_base
+        if literal.exists():
+            return str(literal)
+        raise RuntimeError(f"yt-dlp reported success but no {out_base}.* file appeared in {out_dir}")
+    # Prefer a single real container; if yt-dlp left both partials, pick the largest.
+    real = [c for c in candidates if c.is_file() and c.stat().st_size > 0]
+    if not real:
+        raise RuntimeError(f"yt-dlp left only empty/partial files for {out_base}: {candidates}")
+    chosen = max(real, key=lambda p: p.stat().st_size)
+    # Clean up any non-chosen partials so the count_frames/transcribe step sees one file.
+    for stale in real:
+        if stale != chosen:
+            stale.unlink()
+    print(f"Downloaded: {chosen}")
+    return str(chosen)
 
 
 def transcribe(video_file: str) -> str:
     """Run whisper-cli on the video (ffmpeg support is compiled in, so
-    .mp4/.mkv are read directly) and return the transcript text."""
+    .mp4/.mkv are read directly) and return the transcript text.
+    If given a .txt file, it is already a transcript - read it as-is
+    (e.g. from the Crawlee caption bridge, no whisper needed)."""
+    if video_file.lower().endswith((".txt", ".vtt")):
+        text = Path(video_file).read_text(encoding="utf-8").strip()
+        if not text:
+            raise RuntimeError("Transcript file is empty.")
+        return text
     out_dir = Path("output")
     out_dir.mkdir(exist_ok=True)
     stem = out_dir / "transcript"
